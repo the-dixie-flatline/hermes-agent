@@ -1475,3 +1475,82 @@ class TestContextAllocation:
 
         assert HonchoClientConfig().context_allocation == "sequential"
         assert HonchoClientConfig().context_component_weights == {}
+
+
+class TestContextAllocationAdversarial:
+    """Defects found by attacking the allocator rather than exercising it.
+
+    Each of these shipped in the first draft and is a distinct way for a
+    budget-bounding function to either exceed its budget or silently delete
+    context. They are regression tests, not hypotheticals.
+    """
+
+    def _provider(self, weights=None, tokens=1200):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(
+            context_tokens=tokens,
+            context_allocation="proportional",
+            context_component_weights=weights or {},
+        )
+        return provider
+
+    def test_all_zero_weights_degrade_not_delete(self):
+        """A misconfigured weight must not empty the whole block."""
+        provider = self._provider({"summary": 0.0, "user_representation": 0.0})
+        result = provider._allocate_components(
+            [("summary", "## S\n" + "s" * 3000),
+             ("user_representation", "## U\n" + "u" * 3000)]
+        )
+        assert result, "zero weights deleted every component"
+        assert len(result) <= 4800
+
+    def test_duplicate_names_neither_lost_nor_doubled(self):
+        """Name-keying loses one component and emits the other twice."""
+        provider = self._provider()
+        result = provider._allocate_components(
+            [("dup", "## A\n" + "a" * 3000), ("dup", "## B\n" + "b" * 3000)]
+        )
+        assert "## A" in result and "## B" in result
+        assert len(result) <= 4800, "duplicate names overflowed the budget"
+
+    def test_opaque_base_string_outranks_the_dialectic(self):
+        """The string-cache fallback stands in for all five base components."""
+        provider = self._provider()
+        result = provider._allocate_components(
+            [("base_context", "## BASE\n" + "b" * 10000),
+             ("dialectic", "## DIA\n" + "d" * 10000)]
+        )
+        base = result.index("## DIA") - result.index("## BASE")
+        assert base > len(result) - result.index("## DIA")
+
+    def test_trim_marker_never_exceeds_the_limit(self):
+        """The cut marker must be inside the limit at every limit."""
+        for limit in range(0, 8):
+            out = HonchoMemoryProvider._trim_at_word("hello world", limit)
+            assert len(out) <= limit, f"limit={limit} produced {len(out)}"
+
+    def test_budget_is_never_exceeded_under_fuzz(self):
+        """The one invariant that matters: output never exceeds the budget."""
+        import random
+
+        random.seed(20260824)
+        names = ["summary", "user_representation", "user_card",
+                 "ai_representation", "ai_card", "dialectic",
+                 "base_context", "unknown_thing", "dup"]
+        for _ in range(500):
+            components = [
+                (random.choice(names),
+                 "#" * random.randint(0, 20) + "x" * random.randint(0, 9000))
+                for _ in range(random.randint(1, 7))
+            ]
+            tokens = random.choice([None, 1, 10, 50, 300, 1200, 5000])
+            weights = {
+                random.choice(names): random.choice([0.0, -5, 0.001, 1, 3, "bad", None])
+                for _ in range(random.randint(0, 4))
+            }
+            provider = self._provider(weights, tokens)
+            result = provider._allocate_components(components)
+            if tokens:
+                assert len(result) <= tokens * 4

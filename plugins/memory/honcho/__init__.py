@@ -672,6 +672,11 @@ class HonchoMemoryProvider(MemoryProvider):
         "ai_representation": 0.25,
         "ai_card": 0.10,
         "dialectic": 0.15,
+        # Used only when the base layer is available as one opaque string
+        # (the string cache seeded directly). It stands in for all five base
+        # components, so it carries their combined weight — otherwise the
+        # dialectic alone would outrank the entire base layer.
+        "base_context": 0.85,
     }
     _FALLBACK_COMPONENT_WEIGHT = 0.10
     # Below this a component is dropped rather than rendered as a stub: a
@@ -1013,6 +1018,9 @@ class HonchoMemoryProvider(MemoryProvider):
             return ""
         if len(text) <= limit:
             return text
+        if limit <= len(cls._TRIM_MARKER):
+            # No room for the marker; a hard slice still honours the limit.
+            return text[:limit]
         keep = max(0, limit - len(cls._TRIM_MARKER))
         truncated = text[:keep]
         last_space = truncated.rfind(" ")
@@ -1054,39 +1062,64 @@ class HonchoMemoryProvider(MemoryProvider):
         weights = dict(self.DEFAULT_CONTEXT_COMPONENT_WEIGHTS)
         weights.update(self._config.context_component_weights or {})
 
-        def weight_of(name: str) -> float:
-            return max(float(weights.get(name, self._FALLBACK_COMPONENT_WEIGHT)), 0.0)
+        def weight_of(index: int) -> float:
+            name = components[index][0]
+            raw = weights.get(name, self._FALLBACK_COMPONENT_WEIGHT)
+            try:
+                return max(float(raw), 0.0)
+            except (TypeError, ValueError):
+                return self._FALLBACK_COMPONENT_WEIGHT
 
+        # Keyed by POSITION, not by name. Two components may legitimately carry
+        # the same name, and a name-keyed map both loses one of them and emits
+        # the survivor twice — overflowing the very budget this enforces.
+        pending = {i: text for i, (_, text) in enumerate(components)}
+        final: dict[int, str] = {}
         remaining = max(0, budget - 2 * (len(components) - 1))
-        pending = dict(components)
-        final: dict[str, str] = {}
+
+        # Every weight non-positive would drop the whole block. Fall back to
+        # equal shares: a misconfigured weight must degrade the split, never
+        # delete the context.
+        if sum(weight_of(i) for i in pending) <= 0:
+            logger.warning(
+                "Honcho contextComponentWeights sum to zero; using equal shares"
+            )
+            weights = {name: 1.0 for name, _ in components}
 
         # Hand out shares; anything under its share returns the surplus to the
         # pool and the loop runs again for those still over. Terminates because
         # each pass either settles a component or falls through to the trim.
         while pending:
-            total_weight = sum(weight_of(n) for n in pending)
+            total_weight = sum(weight_of(i) for i in pending)
             if total_weight <= 0:
                 break
             settled_any = False
-            for name in list(pending):
-                share = remaining * (weight_of(name) / total_weight)
-                if len(pending[name]) <= share:
-                    text = pending.pop(name)
-                    final[name] = text
+            for index in list(pending):
+                share = remaining * (weight_of(index) / total_weight)
+                if len(pending[index]) <= share:
+                    text = pending.pop(index)
+                    final[index] = text
                     remaining -= len(text)
                     settled_any = True
             if not settled_any:
-                total_weight = sum(weight_of(n) for n in pending) or 1.0
-                for name, text in pending.items():
-                    share = int(remaining * (weight_of(name) / total_weight))
+                total_weight = sum(weight_of(i) for i in pending) or 1.0
+                for index, text in pending.items():
+                    share = int(remaining * (weight_of(index) / total_weight))
                     if share >= self._MIN_COMPONENT_CHARS:
-                        final[name] = self._trim_at_word(text, share)
+                        final[index] = self._trim_at_word(text, share)
+                    else:
+                        # Silent loss is the failure mode this whole change
+                        # exists to remove; say so rather than just dropping it.
+                        logger.debug(
+                            "Honcho context component %r dropped: share %d < %d",
+                            components[index][0], share, self._MIN_COMPONENT_CHARS,
+                        )
                 pending = {}
                 break
 
-        ordered = [final[n] for n, _ in components if final.get(n)]
-        return "\n\n".join(ordered)
+        return "\n\n".join(
+            final[i] for i in range(len(components)) if final.get(i)
+        )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire background prefetch threads for the upcoming turn.
