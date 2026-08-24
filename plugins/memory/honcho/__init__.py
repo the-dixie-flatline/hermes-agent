@@ -289,6 +289,10 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Base context cache — refreshed on context_cadence, not frozen
         self._base_context_cache: Optional[str] = None
+        # Same base context, kept as components so proportional allocation can
+        # act on them. Parallel to the string cache rather than replacing it:
+        # the string is what sequential mode and the cold-start check use.
+        self._base_components_cache: Optional[list[tuple[str, str]]] = None
         self._base_context_lock = threading.Lock()
 
         # Recall cadence and liveness state.
@@ -647,31 +651,49 @@ class HonchoMemoryProvider(MemoryProvider):
             return True
         return not (self._init_thread and self._init_thread.is_alive())
 
+    # Canonical order of the injected context components. The order is what
+    # "sequential" allocation cuts from the tail of; "proportional" preserves
+    # it for rendering but no longer lets it decide who is starved.
+    CONTEXT_COMPONENTS: tuple[tuple[str, str, str], ...] = (
+        ("summary", "summary", "Session Summary"),
+        ("user_representation", "representation", "User Representation"),
+        ("user_card", "card", "User Peer Card"),
+        ("ai_representation", "ai_representation", "AI Self-Representation"),
+        ("ai_card", "ai_card", "AI Identity Card"),
+    )
+
+    # Weights used when context_allocation == "proportional". These are shares
+    # of the budget, not caps: whatever a component does not use is handed back
+    # and redistributed, so small cards cost nothing when they are small.
+    DEFAULT_CONTEXT_COMPONENT_WEIGHTS: dict[str, float] = {
+        "summary": 0.15,
+        "user_representation": 0.25,
+        "user_card": 0.10,
+        "ai_representation": 0.25,
+        "ai_card": 0.10,
+        "dialectic": 0.15,
+    }
+    _FALLBACK_COMPONENT_WEIGHT = 0.10
+    # Below this a component is dropped rather than rendered as a stub: a
+    # 20-character fragment of a representation is noise, not context.
+    _MIN_COMPONENT_CHARS = 80
+
+    def _format_components(self, ctx: dict) -> list[tuple[str, str]]:
+        """Render the base context into (component_name, section_text) pairs.
+
+        Split out of _format_first_turn_context so budget allocation can act on
+        the components individually instead of on one opaque joined string.
+        """
+        out: list[tuple[str, str]] = []
+        for name, key, heading in self.CONTEXT_COMPONENTS:
+            value = ctx.get(key, "")
+            if value:
+                out.append((name, f"## {heading}\n{value}"))
+        return out
+
     def _format_first_turn_context(self, ctx: dict) -> str:
         """Format the prefetch context dict into a readable system prompt block."""
-        parts = []
-
-        # Session summary — session-scoped context, placed first for relevance
-        summary = ctx.get("summary", "")
-        if summary:
-            parts.append(f"## Session Summary\n{summary}")
-
-        rep = ctx.get("representation", "")
-        if rep:
-            parts.append(f"## User Representation\n{rep}")
-
-        card = ctx.get("card", "")
-        if card:
-            parts.append(f"## User Peer Card\n{card}")
-
-        ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
-
-        ai_card = ctx.get("ai_card", "")
-        if ai_card:
-            parts.append(f"## AI Identity Card\n{ai_card}")
-
+        parts = [text for _, text in self._format_components(ctx)]
         if not parts:
             return ""
         return "\n\n".join(parts)
@@ -768,6 +790,10 @@ class HonchoMemoryProvider(MemoryProvider):
             return self._truncate_to_budget(ready) if ready else ""
 
         parts = []
+        # Same content as ``parts``, tagged by component so proportional
+        # allocation can weigh them. Built alongside rather than derived from
+        # ``parts``, because a joined string cannot be taken apart again.
+        components: list[tuple[str, str]] = []
 
         # One-time notice, relayed by the model, that auth is dead and memory is paused.
         auth_notice = self._pop_auth_notice()
@@ -810,10 +836,12 @@ class HonchoMemoryProvider(MemoryProvider):
                 _ctx = _ctx_holder.get("ctx")
                 if _ctx:
                     self._manager.pop_context_result(self._session_key)
+                    _components = self._format_components(_ctx)
                     formatted = self._format_first_turn_context(_ctx)
                     if formatted:
                         with self._base_context_lock:
                             self._base_context_cache = formatted
+                            self._base_components_cache = _components
                         base_context = formatted
                 elif _bt.is_alive():
                     logger.debug(
@@ -825,14 +853,23 @@ class HonchoMemoryProvider(MemoryProvider):
             if not _first_base_fetch and self._manager:
                 fresh_ctx = self._manager.pop_context_result(self._session_key)
                 if fresh_ctx:
+                    _components = self._format_components(fresh_ctx)
                     formatted = self._format_first_turn_context(fresh_ctx)
                     if formatted:
                         with self._base_context_lock:
                             self._base_context_cache = formatted
+                            self._base_components_cache = _components
                         base_context = formatted
 
             if base_context:
                 parts.append(base_context)
+                with self._base_context_lock:
+                    _cached_components = self._base_components_cache
+                # Fall back to the opaque string when only it is present (tests
+                # and any path that seeds the string cache directly).
+                components.extend(
+                    _cached_components or [("base_context", base_context)]
+                )
 
         # ----- Layer 2: Dialectic supplement -----
         # Turn 1 may briefly wait for dialectic; unfinished work remains async.
@@ -892,9 +929,21 @@ class HonchoMemoryProvider(MemoryProvider):
 
         if dialectic_result and dialectic_result.strip():
             parts.append(dialectic_result)
+            components.append(("dialectic", dialectic_result))
 
         if not parts:
             return ""
+
+        allocation = getattr(self._config, "context_allocation", "sequential")
+        if allocation == "proportional" and components:
+            # The auth notice is a one-time operational message, not context:
+            # reserve it whole rather than letting it compete for a share.
+            notice = auth_notice if auth_notice else ""
+            body = self._allocate_components(
+                [(n, t) for n, t in components if n != "auth_notice"],
+                reserve=(len(notice) + 2) if notice else 0,
+            )
+            return "\n\n".join(x for x in (notice, body) if x)
 
         result = "\n\n".join(parts)
 
@@ -944,19 +993,100 @@ class HonchoMemoryProvider(MemoryProvider):
             return ""
         return dialectic_result if (dialectic_result and dialectic_result.strip()) else ""
 
+    def _budget_chars(self) -> int:
+        """Character budget for the injected block, or 0 when uncapped."""
+        if not self._config or not self._config.context_tokens:
+            return 0
+        return self._config.context_tokens * 4  # conservative char estimate
+
+    _TRIM_MARKER = " …"
+
+    @classmethod
+    def _trim_at_word(cls, text: str, limit: int) -> str:
+        """Trim to ``limit`` on a word boundary, marking the cut.
+
+        The marker is counted inside the limit, so the result is never longer
+        than ``limit``. Allocation sums these per component, and a marker that
+        overflowed its share would push the whole block past the budget.
+        """
+        if limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        keep = max(0, limit - len(cls._TRIM_MARKER))
+        truncated = text[:keep]
+        last_space = truncated.rfind(" ")
+        if last_space > keep * 0.8:
+            truncated = truncated[:last_space]
+        return truncated + cls._TRIM_MARKER
+
     def _truncate_to_budget(self, text: str) -> str:
         """Truncate text to fit within context_tokens budget if set."""
-        if not self._config or not self._config.context_tokens:
+        budget_chars = self._budget_chars()
+        if not budget_chars or len(text) <= budget_chars:
             return text
-        budget_chars = self._config.context_tokens * 4  # conservative char estimate
-        if len(text) <= budget_chars:
-            return text
-        # Truncate at word boundary
-        truncated = text[:budget_chars]
-        last_space = truncated.rfind(" ")
-        if last_space > budget_chars * 0.8:
-            truncated = truncated[:last_space]
-        return truncated + " …"
+        return self._trim_at_word(text, budget_chars)
+
+    def _allocate_components(
+        self, components: list[tuple[str, str]], reserve: int = 0
+    ) -> str:
+        """Divide the budget across components by weight, not by position.
+
+        Sequential allocation concatenates in a fixed order and cuts the tail,
+        so any component whose predecessors already fill the budget is
+        unreachable no matter how important it is — an agent's own
+        self-representation can be computed on every turn and never once
+        rendered. This gives each component a weighted share and hands back
+        whatever it does not use, so the small components cost only their real
+        size and the large ones split what is left.
+
+        Order is preserved for rendering; only the share decision changes.
+        """
+        components = [(n, t) for n, t in components if t and t.strip()]
+        if not components:
+            return ""
+
+        budget = max(0, self._budget_chars() - reserve)
+        joined_len = sum(len(t) for _, t in components) + 2 * (len(components) - 1)
+        if not self._budget_chars() or joined_len <= budget:
+            return "\n\n".join(t for _, t in components)
+
+        weights = dict(self.DEFAULT_CONTEXT_COMPONENT_WEIGHTS)
+        weights.update(self._config.context_component_weights or {})
+
+        def weight_of(name: str) -> float:
+            return max(float(weights.get(name, self._FALLBACK_COMPONENT_WEIGHT)), 0.0)
+
+        remaining = max(0, budget - 2 * (len(components) - 1))
+        pending = dict(components)
+        final: dict[str, str] = {}
+
+        # Hand out shares; anything under its share returns the surplus to the
+        # pool and the loop runs again for those still over. Terminates because
+        # each pass either settles a component or falls through to the trim.
+        while pending:
+            total_weight = sum(weight_of(n) for n in pending)
+            if total_weight <= 0:
+                break
+            settled_any = False
+            for name in list(pending):
+                share = remaining * (weight_of(name) / total_weight)
+                if len(pending[name]) <= share:
+                    text = pending.pop(name)
+                    final[name] = text
+                    remaining -= len(text)
+                    settled_any = True
+            if not settled_any:
+                total_weight = sum(weight_of(n) for n in pending) or 1.0
+                for name, text in pending.items():
+                    share = int(remaining * (weight_of(name) / total_weight))
+                    if share >= self._MIN_COMPONENT_CHARS:
+                        final[name] = self._trim_at_word(text, share)
+                pending = {}
+                break
+
+        ordered = [final[n] for n, _ in components if final.get(n)]
+        return "\n\n".join(ordered)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire background prefetch threads for the upcoming turn.

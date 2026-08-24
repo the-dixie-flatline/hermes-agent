@@ -174,6 +174,28 @@ def _parse_context_tokens(host_val, root_val) -> int | None:
     return None
 
 
+def _parse_component_weights(host_val, root_val) -> dict[str, float]:
+    """Parse contextComponentWeights: host wins, then root, then empty.
+
+    Non-mapping values and non-numeric or negative weights are dropped rather
+    than raising: a malformed weight must not take memory injection down.
+    """
+    for val in (host_val, root_val):
+        if not isinstance(val, dict):
+            continue
+        out: dict[str, float] = {}
+        for key, weight in val.items():
+            try:
+                parsed = float(weight)
+            except (TypeError, ValueError):
+                continue
+            if parsed >= 0:
+                out[str(key)] = parsed
+        if out:
+            return out
+    return {}
+
+
 def _parse_int_config(host_val, root_val, default: int) -> int:
     """Parse an integer config: host wins, then root, then default."""
     for val in (host_val, root_val):
@@ -452,6 +474,18 @@ class HonchoClientConfig:
     injection_frequency: str = "every-turn"
     # Minimum turns between peer.context() API calls (base layer refresh cadence)
     context_cadence: int = 1
+    # How the context budget is divided across the injected components.
+    # "sequential" (default) — concatenate in a fixed order and cut the tail.
+    #   Components late in that order are starved entirely whenever the ones
+    #   before them already fill the budget, however important they are.
+    # "proportional" — give every component a weighted share of the budget and
+    #   redistribute whatever the small ones do not use, so no component can be
+    #   structurally unreachable.
+    context_allocation: str = "sequential"
+    # Component weights for context_allocation == "proportional". Keys are
+    # component names (see CONTEXT_COMPONENTS); empty means the built-in
+    # defaults. Unknown keys are ignored; missing ones fall back to default.
+    context_component_weights: dict[str, float] = field(default_factory=dict)
     # Minimum turns between dialectic prefetch fires (supplement layer cadence)
     dialectic_cadence: int = 1
     # Rewrite the latest user message into a retrieval query before dialectic.
@@ -765,6 +799,15 @@ class HonchoClientConfig:
             injection_frequency=(
                 host_block.get("injectionFrequency")
                 or raw.get("injectionFrequency", "every-turn")
+            ),
+            context_allocation=(
+                host_block.get("contextAllocation")
+                or raw.get("contextAllocation")
+                or "sequential"
+            ),
+            context_component_weights=_parse_component_weights(
+                host_block.get("contextComponentWeights"),
+                raw.get("contextComponentWeights"),
             ),
             context_cadence=_parse_int_config(
                 host_block.get("contextCadence"),
