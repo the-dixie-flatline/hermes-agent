@@ -298,6 +298,40 @@ Host key is derived from the active Hermes profile: `hermes` (default) or `herme
 | `contextTokens` | int | SDK default | Token budget for `context()` API calls. Also gates prefetch truncation (tokens × 4 chars) |
 | `messageMaxChars` | int | `25000` | Max chars per message sent via `add_messages()`. Exceeding this triggers chunking with `[continued]` markers. Honcho cloud limit: 25k |
 
+### Budget allocation
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `contextAllocation` | string | `"sequential"` | `"sequential"` or `"proportional"` — how `contextTokens` is divided across the injected components |
+| `contextComponentWeights` | object | `{}` | Per-component shares for `"proportional"`. Keys: `summary`, `user_representation`, `user_card`, `ai_representation`, `ai_card`, `dialectic` |
+
+`sequential` (the default, and the historical behaviour) concatenates the
+components in a fixed order and cuts the tail to fit. That makes position, not
+importance, decide what survives: whenever the earlier components already fill
+the budget, everything after them is unreachable on **every** turn while still
+being fetched and paid for on every turn. A user representation larger than the
+whole budget silently costs you the AI self-representation, the peer cards, and
+the entire dialectic layer.
+
+`proportional` gives each component a weighted share and redistributes whatever
+the small ones do not use, so nothing is structurally starved. Render order is
+unchanged; only the share decision moves. Measured on a real 4,800-char budget
+with a 5,735-char user representation:
+
+```
+sequential    summary 821 | user_rep 3979 | cards 0 | ai_rep 0      (4800 chars)
+proportional  summary 821 | user_rep 1955 | cards 68 | ai_rep 1955  (4799 chars)
+```
+
+Same cost, and the agent's own self-model actually arrives. Weights are shares,
+not caps — a 12-character peer card consumes 12 characters and hands the rest
+of its share back.
+
+```json
+"contextAllocation": "proportional",
+"contextComponentWeights": { "ai_representation": 0.35, "user_representation": 0.25 }
+```
+
 ### Cadence (Cost Control)
 
 | Key | Type | Default | Description |

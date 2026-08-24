@@ -1315,3 +1315,242 @@ class TestGetSessionContextFallback:
         assert peer_id == "user-peer"
         assert target == "user-peer"
 
+
+
+class TestContextAllocation:
+    """Budget division across injected components.
+
+    Sequential allocation cuts the tail, so a component whose predecessors
+    already fill the budget is unreachable regardless of its importance.
+    These pin the real case that motivated the option: a user representation
+    larger than the whole budget, which starves the AI self-representation on
+    every turn while still being computed on every turn.
+    """
+
+    @staticmethod
+    def _ctx(user_rep_chars=5735, ai_rep_chars=6440):
+        return {
+            "summary": "S" * 200,
+            "representation": "u" * user_rep_chars,
+            "card": "c" * 670,
+            "ai_representation": "a" * ai_rep_chars,
+            "ai_card": "d" * 924,
+        }
+
+    def _provider(self, allocation="sequential", weights=None, tokens=1200):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(
+            context_tokens=tokens,
+            context_allocation=allocation,
+            context_component_weights=weights or {},
+        )
+        return provider
+
+    def test_sequential_starves_the_tail(self):
+        """Default behaviour is unchanged: late components never render."""
+        provider = self._provider("sequential")
+        joined = provider._format_first_turn_context(self._ctx())
+        result = provider._truncate_to_budget(joined)
+
+        assert len(result) <= 4805
+        assert "## Session Summary" in result
+        # Everything past the user representation is gone — the defect.
+        assert "## AI Self-Representation" not in result
+        assert "## AI Identity Card" not in result
+
+    def test_proportional_reaches_every_component(self):
+        """Each component gets a share, so none is structurally unreachable."""
+        provider = self._provider("proportional")
+        components = provider._format_components(self._ctx())
+        result = provider._allocate_components(components)
+
+        assert len(result) <= 4800
+        for heading in (
+            "## Session Summary",
+            "## User Representation",
+            "## User Peer Card",
+            "## AI Self-Representation",
+            "## AI Identity Card",
+        ):
+            assert heading in result, f"{heading} was starved"
+
+    def test_proportional_preserves_render_order(self):
+        provider = self._provider("proportional")
+        result = provider._allocate_components(
+            provider._format_components(self._ctx())
+        )
+        assert result.index("Session Summary") < result.index("User Representation")
+        assert result.index("User Representation") < result.index(
+            "AI Self-Representation"
+        )
+
+    def test_surplus_is_redistributed_not_wasted(self):
+        """Small components return their unused share to the larger ones."""
+        provider = self._provider("proportional")
+        # Tiny cards: their 10% shares should flow to the representations.
+        ctx = self._ctx()
+        ctx["card"] = "c" * 12
+        ctx["ai_card"] = "d" * 16
+        result = provider._allocate_components(provider._format_components(ctx))
+
+        assert "c" * 12 in result  # rendered whole, not trimmed
+        assert "d" * 16 in result
+        # The freed budget went somewhere useful.
+        assert len(result) > 4000
+
+    def test_under_budget_is_untouched(self):
+        """Nothing is trimmed when everything already fits."""
+        provider = self._provider("proportional")
+        ctx = {"summary": "short", "representation": "also short"}
+        result = provider._allocate_components(provider._format_components(ctx))
+        assert result.endswith("also short")
+        assert "…" not in result
+
+    def test_uncapped_budget_allocates_nothing(self):
+        provider = self._provider("proportional", tokens=None)
+        ctx = self._ctx()
+        result = provider._allocate_components(provider._format_components(ctx))
+        assert "a" * 6440 in result
+
+    def test_custom_weights_shift_the_split(self):
+        """An explicit weight moves budget to the component that names it."""
+        provider = self._provider(
+            "proportional",
+            weights={"ai_representation": 10.0, "user_representation": 0.01},
+        )
+        result = provider._allocate_components(
+            provider._format_components(self._ctx())
+        )
+        assert result.count("a") > result.count("u")
+
+    def test_tiny_share_is_dropped_not_stubbed(self):
+        """A share below the floor renders nothing rather than a fragment."""
+        provider = self._provider(
+            "proportional",
+            weights={"ai_card": 0.0001},
+            tokens=300,
+        )
+        result = provider._allocate_components(
+            provider._format_components(self._ctx())
+        )
+        assert "## AI Identity Card" not in result
+
+    def test_malformed_weights_are_ignored(self):
+        """A bad weight must not take memory injection down."""
+        from plugins.memory.honcho.client import _parse_component_weights
+
+        assert _parse_component_weights({"a": "nonsense"}, None) == {}
+        assert _parse_component_weights({"a": -1}, None) == {}
+        assert _parse_component_weights("not-a-dict", None) == {}
+        assert _parse_component_weights({"a": "2.5"}, None) == {"a": 2.5}
+
+    def test_config_parses_the_new_keys(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        raw = {
+            "hosts": {
+                "h": {
+                    "apiKey": "k",
+                    "contextAllocation": "proportional",
+                    "contextComponentWeights": {"ai_representation": 0.5},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "honcho.json"
+            p.write_text(json.dumps(raw), encoding="utf-8")
+            cfg = HonchoClientConfig.from_global_config(host="h", config_path=p)
+
+        assert cfg.context_allocation == "proportional"
+        assert cfg.context_component_weights == {"ai_representation": 0.5}
+
+    def test_default_allocation_is_sequential(self):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        assert HonchoClientConfig().context_allocation == "sequential"
+        assert HonchoClientConfig().context_component_weights == {}
+
+
+class TestContextAllocationAdversarial:
+    """Defects found by attacking the allocator rather than exercising it.
+
+    Each of these shipped in the first draft and is a distinct way for a
+    budget-bounding function to either exceed its budget or silently delete
+    context. They are regression tests, not hypotheticals.
+    """
+
+    def _provider(self, weights=None, tokens=1200):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(
+            context_tokens=tokens,
+            context_allocation="proportional",
+            context_component_weights=weights or {},
+        )
+        return provider
+
+    def test_all_zero_weights_degrade_not_delete(self):
+        """A misconfigured weight must not empty the whole block."""
+        provider = self._provider({"summary": 0.0, "user_representation": 0.0})
+        result = provider._allocate_components(
+            [("summary", "## S\n" + "s" * 3000),
+             ("user_representation", "## U\n" + "u" * 3000)]
+        )
+        assert result, "zero weights deleted every component"
+        assert len(result) <= 4800
+
+    def test_duplicate_names_neither_lost_nor_doubled(self):
+        """Name-keying loses one component and emits the other twice."""
+        provider = self._provider()
+        result = provider._allocate_components(
+            [("dup", "## A\n" + "a" * 3000), ("dup", "## B\n" + "b" * 3000)]
+        )
+        assert "## A" in result and "## B" in result
+        assert len(result) <= 4800, "duplicate names overflowed the budget"
+
+    def test_opaque_base_string_outranks_the_dialectic(self):
+        """The string-cache fallback stands in for all five base components."""
+        provider = self._provider()
+        result = provider._allocate_components(
+            [("base_context", "## BASE\n" + "b" * 10000),
+             ("dialectic", "## DIA\n" + "d" * 10000)]
+        )
+        base = result.index("## DIA") - result.index("## BASE")
+        assert base > len(result) - result.index("## DIA")
+
+    def test_trim_marker_never_exceeds_the_limit(self):
+        """The cut marker must be inside the limit at every limit."""
+        for limit in range(0, 8):
+            out = HonchoMemoryProvider._trim_at_word("hello world", limit)
+            assert len(out) <= limit, f"limit={limit} produced {len(out)}"
+
+    def test_budget_is_never_exceeded_under_fuzz(self):
+        """The one invariant that matters: output never exceeds the budget."""
+        import random
+
+        random.seed(20260824)
+        names = ["summary", "user_representation", "user_card",
+                 "ai_representation", "ai_card", "dialectic",
+                 "base_context", "unknown_thing", "dup"]
+        for _ in range(500):
+            components = [
+                (random.choice(names),
+                 "#" * random.randint(0, 20) + "x" * random.randint(0, 9000))
+                for _ in range(random.randint(1, 7))
+            ]
+            tokens = random.choice([None, 1, 10, 50, 300, 1200, 5000])
+            weights = {
+                random.choice(names): random.choice([0.0, -5, 0.001, 1, 3, "bad", None])
+                for _ in range(random.randint(0, 4))
+            }
+            provider = self._provider(weights, tokens)
+            result = provider._allocate_components(components)
+            if tokens:
+                assert len(result) <= tokens * 4
