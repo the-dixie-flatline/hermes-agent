@@ -2824,6 +2824,115 @@ class TestHandleMaxIterations:
             for item in input_items
         )
 
+    def test_codex_summary_strips_tool_controls_when_tools_removed(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._cached_system_prompt = "You are helpful."
+        captured = {}
+
+        monkey_kwargs = {
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "do stuff"}],
+            "tools": [{"type": "function", "name": "web_search"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        }
+
+        def fake_run_codex_stream(kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text="Summary")],
+                    )
+                ],
+            )
+
+        with (
+            patch.object(agent, "_build_api_kwargs", return_value=monkey_kwargs.copy()),
+            patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream),
+        ):
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 90)
+
+        assert result == "Summary"
+        assert "tools" not in captured
+        assert "tool_choice" not in captured
+        assert "parallel_tool_calls" not in captured
+
+    def test_codex_retry_summary_strips_tool_controls_when_tools_removed(self, agent):
+        """The retry branch must strip the same three keys as the primary branch.
+
+        Upstream review of NousResearch/hermes-agent#32777 flagged that the
+        proposed regression test covered only the first summary request, leaving
+        the retry branch untested.  On a strict provider (xAI) the retry is
+        exactly where a transient empty first summary turns into a hard 400.
+        """
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai-oauth"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4.6"
+        agent._cached_system_prompt = "You are helpful."
+        calls = []
+
+        def build_kwargs(_messages):
+            return {
+                "model": "grok-4.6",
+                "input": [{"role": "user", "content": "do stuff"}],
+                "tools": [{"type": "function", "name": "web_search"}],
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+            }
+
+        def fake_run_codex_stream(kwargs):
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                # Empty first summary drives handle_max_iterations to the retry
+                # branch.  It must be a well-formed response carrying empty text,
+                # not an empty output list — the latter raises and diverts to the
+                # outer handler instead of exercising the retry.
+                return SimpleNamespace(
+                    status="completed",
+                    output=[
+                        SimpleNamespace(
+                            type="message",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text="")],
+                        )
+                    ],
+                )
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text="Retry summary")],
+                    )
+                ],
+            )
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=build_kwargs),
+            patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream),
+        ):
+            result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 90)
+
+        assert result == "Retry summary"
+        assert len(calls) == 2, "retry branch did not fire"
+        for label, sent in (("primary", calls[0]), ("retry", calls[1])):
+            assert "tools" not in sent, label
+            assert "tool_choice" not in sent, label
+            assert "parallel_tool_calls" not in sent, label
+
     def test_api_sanitizer_matches_responses_call_id_when_id_differs(self, agent):
         messages = [
             {
